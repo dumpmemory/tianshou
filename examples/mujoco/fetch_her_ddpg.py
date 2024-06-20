@@ -213,6 +213,7 @@ def test_ddpg(args: argparse.Namespace = get_args()) -> None:
             )
     train_collector = Collector(policy, train_envs, buffer, exploration_noise=True)
     test_collector = Collector(policy, test_envs)
+    train_collector.reset()
     train_collector.collect(n_step=args.start_timesteps, random=True)
 
     def save_best_fn(policy: BasePolicy) -> None:
@@ -237,7 +238,6 @@ def test_ddpg(args: argparse.Namespace = get_args()) -> None:
         pprint.pprint(result)
 
     # Let's watch its performance!
-    policy.eval()
     test_envs.seed(args.seed)
     test_collector.reset()
     collector_stats = test_collector.collect(n_episode=args.test_num, render=args.render)

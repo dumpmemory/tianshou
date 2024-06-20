@@ -2,9 +2,10 @@ import os
 import pickle
 from abc import abstractmethod
 from collections.abc import Sequence
+from copy import deepcopy
 from dataclasses import dataclass
 from pprint import pformat
-from typing import Self
+from typing import TYPE_CHECKING, Any, Self, Union, cast
 
 import numpy as np
 import torch
@@ -78,10 +79,13 @@ from tianshou.highlevel.trainer import (
 )
 from tianshou.highlevel.world import World
 from tianshou.policy import BasePolicy
-from tianshou.utils import LazyLogger, logging
+from tianshou.utils import LazyLogger, deprecation, logging
 from tianshou.utils.logging import datetime_tag
 from tianshou.utils.net.common import ModuleType
 from tianshou.utils.string import ToStringMixin
+
+if TYPE_CHECKING:
+    from tianshou.evaluation.launcher import ExpLauncher, RegisteredExpLauncher
 
 log = logging.getLogger(__name__)
 
@@ -143,6 +147,7 @@ class Experiment(ToStringMixin):
         env_factory: EnvFactory,
         agent_factory: AgentFactory,
         sampling_config: SamplingConfig,
+        name: str,
         logger_factory: LoggerFactory | None = None,
     ):
         if logger_factory is None:
@@ -152,6 +157,7 @@ class Experiment(ToStringMixin):
         self.env_factory = env_factory
         self.agent_factory = agent_factory
         self.logger_factory = logger_factory
+        self.name = name
 
     @classmethod
     def from_directory(cls, directory: str, restore_policy: bool = True) -> "Experiment":
@@ -166,6 +172,20 @@ class Experiment(ToStringMixin):
         if restore_policy:
             experiment.config.policy_restore_directory = directory
         return experiment
+
+    def get_seeding_info_as_str(self) -> str:
+        """Returns information on the seeds used in the experiment as a string.
+
+        This can be useful for creating unique experiment names based on seeds, e.g.
+        A typical example is to do `experiment.name = f"{experiment.name}_{experiment.get_seeding_info_as_str()}"`.
+        """
+        return "_".join(
+            [
+                f"exp_seed={self.config.seed}",
+                f"train_seed={self.sampling_config.train_seed}",
+                f"test_seed={self.sampling_config.test_seed}",
+            ],
+        )
 
     def _set_seed(self) -> None:
         seed = self.config.seed
@@ -186,35 +206,50 @@ class Experiment(ToStringMixin):
 
     def run(
         self,
-        experiment_name: str | None = None,
+        run_name: str | None = None,
         logger_run_id: str | None = None,
+        raise_error_on_dirname_collision: bool = True,
+        **kwargs: dict[str, Any],
     ) -> ExperimentResult:
         """Run the experiment and return the results.
 
-        :param experiment_name: the experiment name, which corresponds to the directory (within the logging
-            directory) where all results associated with the experiment will be saved.
+        :param run_name: Defines a name for this run of the experiment, which determines
+            the subdirectory (within the persistence base directory) where all results will be saved.
+            If None, the experiment's name will be used.
             The name may contain path separators (i.e. `os.path.sep`, as used by `os.path.join`), in which case
             a nested directory structure will be created.
-            If None, use a name containing the current date and time.
         :param logger_run_id: Run identifier to use for logger initialization/resumption (applies when
             using wandb, in particular).
+        :param raise_error_on_dirname_collision: set to `False` e.g., when continuing a previously executed
+            experiment with the same name.
+        :param kwargs: for backward compatibility with old parameter names only
         :return:
         """
-        if experiment_name is None:
-            experiment_name = datetime_tag()
+        # backward compatibility
+        _experiment_name = kwargs.pop("experiment_name", None)
+        if _experiment_name is not None:
+            run_name = cast(str, _experiment_name)
+            deprecation(
+                "Parameter run_name should now be used instead of experiment_name. "
+                "Support for experiment_name will be removed in the future.",
+            )
+        assert len(kwargs) == 0, f"Received unexpected arguments: {kwargs}"
+
+        if run_name is None:
+            run_name = self.name
 
         # initialize persistence directory
         use_persistence = self.config.persistence_enabled
-        persistence_dir = os.path.join(self.config.persistence_base_dir, experiment_name)
+        persistence_dir = os.path.join(self.config.persistence_base_dir, run_name)
         if use_persistence:
-            os.makedirs(persistence_dir, exist_ok=True)
+            os.makedirs(persistence_dir, exist_ok=not raise_error_on_dirname_collision)
 
         with logging.FileLoggerContext(
             os.path.join(persistence_dir, self.LOG_FILENAME),
             enabled=use_persistence and self.config.log_file_enabled,
         ):
             # log initial information
-            log.info(f"Running experiment (name='{experiment_name}'):\n{self.pprints()}")
+            log.info(f"Running experiment (name='{run_name}'):\n{self.pprints()}")
             log.info(f"Working directory: {os.getcwd()}")
 
             self._set_seed()
@@ -245,7 +280,7 @@ class Experiment(ToStringMixin):
             if use_persistence:
                 logger = self.logger_factory.create_logger(
                     log_dir=persistence_dir,
-                    experiment_name=experiment_name,
+                    experiment_name=run_name,
                     run_id=logger_run_id,
                     config_dict=full_config,
                 )
@@ -309,14 +344,31 @@ class Experiment(ToStringMixin):
         env: BaseVectorEnv,
         render: float,
     ) -> None:
-        policy.eval()
         collector = Collector(policy, env)
-        result = collector.collect(n_episode=num_episodes, render=render, reset_before_collect=True)
+        collector.reset()
+        result = collector.collect(n_episode=num_episodes, render=render)
         assert result.returns_stat is not None  # for mypy
         assert result.lens_stat is not None  # for mypy
         log.info(
             f"Watched episodes: mean reward={result.returns_stat.mean}, mean episode length={result.lens_stat.mean}",
         )
+
+
+class ExperimentCollection:
+    """Shallow wrapper around a list of experiments providing a simple interface for running them with a launcher."""
+
+    def __init__(self, experiments: list[Experiment]):
+        self.experiments = experiments
+
+    def run(
+        self,
+        launcher: Union["ExpLauncher", "RegisteredExpLauncher"],
+    ) -> list[InfoStats | None]:
+        from tianshou.evaluation.launcher import RegisteredExpLauncher
+
+        if isinstance(launcher, RegisteredExpLauncher):
+            launcher = launcher.create_launcher()
+        return launcher.launch(experiments=self.experiments)
 
 
 class ExperimentBuilder:
@@ -337,6 +389,26 @@ class ExperimentBuilder:
         self._optim_factory: OptimizerFactory | None = None
         self._policy_wrapper_factory: PolicyWrapperFactory | None = None
         self._trainer_callbacks: TrainerCallbacks = TrainerCallbacks()
+        self._name: str = self.__class__.__name__.replace("Builder", "") + "_" + datetime_tag()
+
+    def copy(self) -> Self:
+        return deepcopy(self)
+
+    @property
+    def experiment_config(self) -> ExperimentConfig:
+        return self._config
+
+    @experiment_config.setter
+    def experiment_config(self, experiment_config: ExperimentConfig) -> None:
+        self._config = experiment_config
+
+    @property
+    def sampling_config(self) -> SamplingConfig:
+        return self._sampling_config
+
+    @sampling_config.setter
+    def sampling_config(self, sampling_config: SamplingConfig) -> None:
+        self._sampling_config = sampling_config
 
     def with_logger_factory(self, logger_factory: LoggerFactory) -> Self:
         """Allows to customize the logger factory to use.
@@ -414,6 +486,19 @@ class ExperimentBuilder:
         self._trainer_callbacks.epoch_stop_callback = callback
         return self
 
+    def with_name(
+        self,
+        name: str,
+    ) -> Self:
+        """Sets the name of the experiment.
+
+        :param name: the name to use for this experiment, which, when the experiment is run,
+            will determine the storage sub-folder by default
+        :return: the builder
+        """
+        self._name = name
+        return self
+
     @abstractmethod
     def _create_agent_factory(self) -> AgentFactory:
         pass
@@ -434,13 +519,31 @@ class ExperimentBuilder:
         if self._policy_wrapper_factory:
             agent_factory.set_policy_wrapper_factory(self._policy_wrapper_factory)
         experiment: Experiment = Experiment(
-            self._config,
-            self._env_factory,
-            agent_factory,
-            self._sampling_config,
-            self._logger_factory,
+            config=self._config,
+            env_factory=self._env_factory,
+            agent_factory=agent_factory,
+            sampling_config=self._sampling_config,
+            name=self._name,
+            logger_factory=self._logger_factory,
         )
         return experiment
+
+    def build_seeded_collection(self, num_experiments: int) -> ExperimentCollection:
+        """Creates a collection of experiments with non-overlapping random seeds, starting from the configured seed.
+
+        Each experiment in the collection will have a unique name that is created from the original experiment name and the seeds used.
+        """
+        num_train_envs = self.sampling_config.num_train_envs
+
+        seeded_experiments = []
+        for i in range(num_experiments):
+            builder = self.copy()
+            builder.experiment_config.seed += i
+            builder.sampling_config.train_seed += i * num_train_envs
+            experiment = builder.build()
+            experiment.name += f"_{experiment.get_seeding_info_as_str()}"
+            seeded_experiments.append(experiment)
+        return ExperimentCollection(seeded_experiments)
 
 
 class _BuilderMixinActorFactory(ActorFutureProviderProtocol):

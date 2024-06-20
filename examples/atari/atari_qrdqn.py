@@ -166,7 +166,6 @@ def test_qrdqn(args: argparse.Namespace = get_args()) -> None:
     # watch agent's performance
     def watch() -> None:
         print("Setup test envs ...")
-        policy.eval()
         policy.set_eps(args.eps_test)
         test_envs.seed(args.seed)
         if args.save_buffer_name:
@@ -194,6 +193,7 @@ def test_qrdqn(args: argparse.Namespace = get_args()) -> None:
         sys.exit(0)
 
     # test train_collector and start filling replay buffer
+    train_collector.reset()
     train_collector.collect(n_step=args.batch_size * args.training_num)
     # trainer
     result = OffpolicyTrainer(

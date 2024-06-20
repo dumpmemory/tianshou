@@ -53,6 +53,9 @@ class SamplingConfig(ToStringMixin):
     num_train_envs: int = -1
     """the number of training environments to use. If set to -1, use number of CPUs/threads."""
 
+    train_seed: int = 42
+    """the seed to use for the training environments."""
+
     num_test_envs: int = 1
     """the number of test environments to use"""
 
@@ -82,7 +85,7 @@ class SamplingConfig(ToStringMixin):
     """
     controls, within one gradient update step of an on-policy algorithm, the number of times an
     actual gradient update is applied using the full collected dataset, i.e. if the parameter is
-    `n`, then the collected data shall be used five times to update the policy within the same
+    5, then the collected data shall be used five times to update the policy within the same
     training step.
 
     The parameter is ignored and may be set to None for off-policy and offline algorithms.
@@ -115,9 +118,12 @@ class SamplingConfig(ToStringMixin):
     replay_buffer_ignore_obs_next: bool = False
 
     replay_buffer_save_only_last_obs: bool = False
-    """if True, only the most recent frame is saved when appending to experiences rather than the
-    full stacked frames. This avoids duplicating observations in buffer memory. Set to False to
-    save stacked frames in full.
+    """if True, for the case where the environment outputs stacked frames (e.g. because it
+    is using a `FrameStack` wrapper), save only the most recent frame so as not to duplicate
+    observations in buffer memory. Specifically, if the environment outputs observations `obs` with
+    shape (N, ...), only obs[-1] of shape (...) will be stored.
+    Frame stacking with a fixed number of frames can then be recreated at the buffer level by setting
+    :attr:`replay_buffer_stack_num`.
     """
 
     replay_buffer_stack_num: int = 1
@@ -125,7 +131,14 @@ class SamplingConfig(ToStringMixin):
     the number of consecutive environment observations to stack and use as the observation input
     to the agent for each time step. Setting this to a value greater than 1 can help agents learn
     temporal aspects (e.g. velocities of moving objects for which only positions are observed).
+
+    If the environment already stacks frames (e.g. using a `FrameStack` wrapper), this should either not
+    be used or should be used in conjunction with :attr:`replay_buffer_save_only_last_obs`.
     """
+
+    @property
+    def test_seed(self) -> int:
+        return self.train_seed + self.num_train_envs
 
     def __post_init__(self) -> None:
         if self.num_train_envs == -1:

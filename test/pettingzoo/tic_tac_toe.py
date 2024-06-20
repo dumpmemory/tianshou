@@ -171,7 +171,8 @@ def train_agent(
     )
     test_collector = Collector(policy, test_envs, exploration_noise=True)
     # policy.set_eps(1)
-    train_collector.collect(n_step=args.batch_size * args.training_num, reset_before_collect=True)
+    train_collector.reset()
+    train_collector.collect(n_step=args.batch_size * args.training_num)
     # log
     log_path = os.path.join(args.logdir, "tic_tac_toe", "dqn")
     writer = SummaryWriter(log_path)
@@ -227,7 +228,6 @@ def watch(
 ) -> None:
     env = DummyVectorEnv([partial(get_env, render_mode="human")])
     policy, optim, agents = get_agents(args, agent_learn=agent_learn, agent_opponent=agent_opponent)
-    policy.eval()
     policy.policies[agents[args.agent_id - 1]].set_eps(args.eps_test)
     collector = Collector(policy, env, exploration_noise=True)
     result = collector.collect(n_episode=1, render=args.render)

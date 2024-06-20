@@ -25,6 +25,7 @@ from tianshou.data.types import (
 )
 from tianshou.utils import MultipleLRSchedulers
 from tianshou.utils.print import DataclassPPrintMixin
+from tianshou.utils.torch_utils import policy_within_training_step, torch_train_mode
 
 logger = logging.getLogger(__name__)
 
@@ -213,19 +214,40 @@ class BasePolicy(nn.Module, Generic[TTrainingStats], ABC):
         super().__init__()
         self.observation_space = observation_space
         self.action_space = action_space
-        self._action_type: Literal["discrete", "continuous"]
         if isinstance(action_space, Discrete | MultiDiscrete | MultiBinary):
-            self._action_type = "discrete"
+            action_type = "discrete"
         elif isinstance(action_space, Box):
-            self._action_type = "continuous"
+            action_type = "continuous"
         else:
             raise ValueError(f"Unsupported action space: {action_space}.")
+        self._action_type = cast(Literal["discrete", "continuous"], action_type)
         self.agent_id = 0
         self.updating = False
         self.action_scaling = action_scaling
         self.action_bound_method = action_bound_method
         self.lr_scheduler = lr_scheduler
+        self.is_within_training_step = False
+        """
+        flag indicating whether we are currently within a training step,
+        which encompasses data collection for training (in online RL algorithms)
+        and the policy update (gradient steps).
+
+        It can be used, for example, to control whether a flag controlling deterministic evaluation should
+        indeed be applied, because within a training step, we typically always want to apply stochastic evaluation
+        (even if such a flag is enabled), as well as stochastic action computation for q-targets (e.g. in SAC
+        based algorithms).
+
+        This flag should normally remain False and should be set to True only by the algorithm which performs
+        training steps. This is done automatically by the Trainer classes. If a policy is used outside of a Trainer,
+        the user should ensure that this flag is set correctly before calling update or learn.
+        """
         self._compile()
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        # TODO Use setstate function once merged
+        if "is_within_training_step" not in state:
+            state["is_within_training_step"] = False
+        self.__dict__ = state
 
     @property
     def action_type(self) -> Literal["discrete", "continuous"]:
@@ -301,9 +323,9 @@ class BasePolicy(nn.Module, Generic[TTrainingStats], ABC):
 
         :return: A :class:`~tianshou.data.Batch` which MUST have the following keys:
 
-            * ``act`` an numpy.ndarray or a torch.Tensor, the action over \
+            * ``act`` a numpy.ndarray or a torch.Tensor, the action over \
                 given batch data.
-            * ``state`` a dict, an numpy.ndarray or a torch.Tensor, the \
+            * ``state`` a dict, a numpy.ndarray or a torch.Tensor, the \
                 internal state of the policy, ``None`` as default.
 
         Other keys are user-defined. It depends on the algorithm. For example,
@@ -505,13 +527,22 @@ class BasePolicy(nn.Module, Generic[TTrainingStats], ABC):
         """
         # TODO: when does this happen?
         # -> this happens never in practice as update is either called with a collector buffer or an assert before
+
+        if not self.is_within_training_step:
+            raise RuntimeError(
+                f"update() was called outside of a training step as signalled by {self.is_within_training_step=} "
+                f"If you want to update the policy without a Trainer, you will have to manage the above-mentioned "
+                f"flag yourself. You can to this e.g., by using the contextmanager {policy_within_training_step.__name__}.",
+            )
+
         if buffer is None:
             return TrainingStats()  # type: ignore[return-value]
         start_time = time.time()
         batch, indices = buffer.sample(sample_size)
         self.updating = True
         batch = self.process_fn(batch, buffer, indices)
-        training_stat = self.learn(batch, **kwargs)
+        with torch_train_mode(self):
+            training_stat = self.learn(batch, **kwargs)
         self.post_process_fn(batch, buffer, indices)
         if self.lr_scheduler is not None:
             self.lr_scheduler.step()
@@ -556,19 +587,23 @@ class BasePolicy(nn.Module, Generic[TTrainingStats], ABC):
         advantage + value, which is exactly equivalent to using :math:`TD(\lambda)`
         for estimating returns.
 
+        Setting `v_s_` and `v_s` to None (or all zeros) and `gae_lambda` to 1.0 calculates the
+        discounted return-to-go/ Monte-Carlo return.
+
         :param batch: a data batch which contains several episodes of data in
             sequential order. Mind that the end of each finished episode of batch
             should be marked by done flag, unfinished (or collecting) episodes will be
             recognized by buffer.unfinished_index().
         :param buffer: the corresponding replay buffer.
-        :param numpy.ndarray indices: tell batch's location in buffer, batch is equal
+        :param indices: tells the batch's location in buffer, batch is equal
             to buffer[indices].
-        :param np.ndarray v_s_: the value function of all next states :math:`V(s')`.
+        :param v_s_: the value function of all next states :math:`V(s')`.
             If None, it will be set to an array of 0.
-        :param v_s: the value function of all current states :math:`V(s)`.
-        :param gamma: the discount factor, should be in [0, 1]. Default to 0.99.
+        :param v_s: the value function of all current states :math:`V(s)`. If None,
+            it is set based upon `v_s_` rolled by 1.
+        :param gamma: the discount factor, should be in [0, 1].
         :param gae_lambda: the parameter for Generalized Advantage Estimation,
-            should be in [0, 1]. Default to 0.95.
+            should be in [0, 1].
 
         :return: two numpy arrays (returns, advantage) with each shape (bsz, ).
         """
@@ -612,10 +647,10 @@ class BasePolicy(nn.Module, Generic[TTrainingStats], ABC):
         :param indices: tell batch's location in buffer
         :param function target_q_fn: a function which compute target Q value
             of "obs_next" given data buffer and wanted indices.
-        :param gamma: the discount factor, should be in [0, 1]. Default to 0.99.
+        :param gamma: the discount factor, should be in [0, 1].
         :param n_step: the number of estimation step, should be an int greater
-            than 0. Default to 1.
-        :param rew_norm: normalize the reward to Normal(0, 1), Default to False.
+            than 0.
+        :param rew_norm: normalize the reward to Normal(0, 1).
             TODO: passing True is not supported and will cause an error!
         :return: a Batch. The result will be stored in batch.returns as a
             torch.Tensor with the same shape as target_q_fn's return tensor.
